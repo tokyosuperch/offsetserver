@@ -1,109 +1,221 @@
+/*
+ *  UDP server
+ */
+
 #include <stdio.h>
-#include <string.h>
-#include <sys/types.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
-#include <time.h>
 #include <stdlib.h>
-#include <stdarg.h>
-#include <net/if.h>
-#include <sys/ioctl.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <time.h>
 
-unsigned long long int charToInt(int bytes, ...);
-struct ifreq ifr;
+/*
+ *  サーバ情報を格納する
+ */
+struct server_info {
+    unsigned short sv_port;     /* サーバのポート番号 */
 
-int main(int argc, char** argv)
+    int sd;                     /* ソケットディスクリプタ */
+    struct sockaddr_in sv_addr; /* サーバのアドレス構造体 */
+};
+typedef struct server_info sv_info_t;
+
+struct timespec ts;
+
+/*!
+ * @brief      受信したメッセージをそのままクライアントに返す
+ * @param[in]  info   クライアント接続情報
+ * @param[out] buff   受信したメッセージ
+ * @param[out] errmsg エラーメッセージ格納先
+ * @return     成功ならば0、失敗ならば-1を返す。
+ */
+static int
+udp_echo_process(sv_info_t *info, char *buff, char *errmsg)
 {
-    int sd;
-    int acc_sd;
-    struct sockaddr_in addr;
-    struct timespec ts;
-    struct timespec sync_ts;
+    int rc = 0;
+    int recv_msglen = 0;
+    int ts_len = sizeof(struct timespec);
+    struct sockaddr_in cl_addr = {0};
+    unsigned int cl_addr_len = 0;
 
-    socklen_t sin_size = sizeof(struct sockaddr_in);
-    struct sockaddr_in from_addr;
- 
-    unsigned char buf[2048];
- 
-   // 受信バッファの初期化
-    memset(buf, 0, sizeof(buf));
- 
-    // IPv4 TCP のソケットを作成
-    if((sd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("socket");
-        return -1;
+    char *temp;
+    temp = (char *)malloc(2 * ts_len);
+
+    /* クライアントからメッセージを受信するまでブロックする */
+    cl_addr_len = sizeof(cl_addr);
+    recv_msglen = recvfrom(info->sd, buff, BUFSIZ, 0,
+                           (struct sockaddr *)&cl_addr, &cl_addr_len);
+    if(recv_msglen < 0){
+        sprintf(errmsg, "(line:%d) %s", __LINE__, strerror(errno));
+        return(-1);
     }
 
-    strncpy(ifr.ifr_name, "enp1s0", IFNAMSIZ-1);
-    ioctl(sd, SIOCGIFHWADDR, &ifr);
- 
-    // 待ち受けるIPとポート番号を設定
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(2964);
-    addr.sin_addr.s_addr = INADDR_ANY;
- 
-    // バインドする
-    if(bind(sd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        return -1;
-    }
-    
-    while(1) {
-        // パケット受信待ち状態とする
-        // 待ちうけキューを１０としている
-        if(listen(sd, 10) < 0) {
-            perror("listen");
-            return -1;
-        }
-    
-        // クライアントからコネクト要求が来るまで停止する
-        // 以降、サーバ側は acc_sd を使ってパケットの送受信を行う
-        if((acc_sd = accept(sd, (struct sockaddr *)&from_addr, &sin_size)) < 0) {
-            perror("accept");
-            return -1;
-        }
-  
-        // パケット受信。パケットが到着するまでブロック
-        if(recv(acc_sd, buf, sizeof(buf), 0) < 0) {
-            perror("recv");
-            return -1;
-        }
-        
-        char *temp;
-        temp = (char *)malloc(8 * sizeof(char));
-        // パケットを TCP で送信
-        clock_gettime(CLOCK_REALTIME, &ts);
-        for (int i = 3; i >= 0; i--) temp[(3-i)] = (unsigned char)(ts.tv_sec >> (i * 8)) % 256;
-        for (int i = 3; i >= 0; i--) temp[4+(3-i)] = (unsigned char)(ts.tv_nsec >> (i * 8)) % 256;
+    memcpy(temp, buff, ts_len);
+    // パケットを TCP で送信
+    clock_gettime(CLOCK_REALTIME, &ts);
+    memcpy(temp+ts_len, &ts, ts_len);
 
-        if(send(acc_sd, temp, 8, 0) < 0) {
-            perror("send");
-            return -1;
-        }
-   
-        sync_ts.tv_sec = charToInt(4, buf[0], buf[1], buf[2], buf[3]);
-        sync_ts.tv_nsec = charToInt(4, buf[4], buf[5], buf[6], buf[7]);
-        // 出力
-        printf("Received:\ttv_sec=%ld  tv_nsec=%ld\n",sync_ts.tv_sec,sync_ts.tv_nsec);
-        printf("My time:\ttv_sec=%ld  tv_nsec=%ld\n",ts.tv_sec,ts.tv_nsec);
-        // 受信データの出力
-        // printf("%s\n", buf);
+    /* 応答メッセージを送信する */
+    rc = sendto(info->sd, temp, 2 * ts_len, 0, 
+                (struct sockaddr *)&cl_addr, sizeof(cl_addr));
+    if(rc != 2 * ts_len){
+        /* sendto()が正しく送信できていないエラー */
+        sprintf(errmsg, "(line:%d) %s", __LINE__, strerror(errno));
+        return(-1);
     }
-    return 0;
+    fprintf(stdout, "[client: %s]\n", inet_ntoa(cl_addr.sin_addr));
+
+    return(0);
 }
 
-unsigned long long int charToInt(int bytes, ...) {
-	va_list list;
-	unsigned long long int temp = 0; 
+/*!
+ * @brief      UDPメッセージを受信する
+ * @param[in]  info   クライアント接続情報
+ * @param[out] errmsg エラーメッセージ格納先
+ * @return     成功ならば0、失敗ならば-1を返す。
+ */
+static int
+udp_echo_server(sv_info_t *info, char *errmsg)
+{
+    int rc = 0;
+    int exit_flag = 1;
+    char buff[BUFSIZ];
 
-	va_start(list, bytes);
-	for(int i = 0; i < bytes; i++) {
-		temp += va_arg(list, int);
-		if (bytes - i > 1) temp = temp << 8;
-	}
-	va_end(list);
+    while(exit_flag){
+        rc = udp_echo_process(info, buff, errmsg);
+        if(rc != 0) return(-1);
 
-	return temp;
+        /* 受信メッセージを標準出力する */
+        // fprintf(stdout, "Received: %s\n", buff);
+
+        /* クライアントからのサーバ終了命令を確認する */
+        if(strcmp(buff, "terminate") == 0){
+            exit_flag = 0;
+        }
+    }
+
+    return( 0 );
 }
+
+/*!
+ * @brief      ソケットの初期化
+ * @param[in]  info   クライアント接続情報
+ * @param[out] errmsg エラーメッセージ格納先
+ * @return     成功ならば0、失敗ならば-1を返す。
+ */
+static int
+socket_initialize(sv_info_t *info, char *errmsg)
+{
+    int rc = 0;
+
+    /* ソケットの生成 : UDPを指定する */
+    info->sd = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if(info->sd < 0){
+        sprintf(errmsg, "(line:%d) %s", __LINE__, strerror(errno));
+        return(-1);
+    }
+
+    /* サーバのアドレス構造体を作成する */
+    info->sv_addr.sin_family = AF_INET;
+    info->sv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    info->sv_addr.sin_port = htons(info->sv_port);
+
+    /* ローカルアドレスへバインドする */
+    rc = bind(info->sd, (struct sockaddr *)&(info->sv_addr),
+              sizeof(info->sv_addr));
+    if(rc != 0){
+        sprintf(errmsg, "(line:%d) %s", __LINE__, strerror(errno));
+        return(-1);
+    }
+
+    return(0);
+}
+
+/*!
+ * @brief      ソケットの終期化
+ * @param[in]  info   クライアント接続情報
+ * @return     成功ならば0、失敗ならば-1を返す。
+ */
+static void
+socket_finalize(sv_info_t *info)
+{
+    /* ソケット破棄 */
+    if(info->sd != 0) close(info->sd);
+
+    return;
+}
+
+/*!
+ * @brief      UDPサーバ実行
+ * @param[in]  info   クライアント接続情報
+ * @param[out] errmsg エラーメッセージ格納先
+ * @return     成功ならば0、失敗ならば-1を返す。
+ */
+static int
+udp_server(sv_info_t *info, char *errmsg)
+{
+    int rc = 0;
+
+    /* ソケットの初期化 */
+    rc = socket_initialize(info, errmsg);
+    if(rc != 0) return(-1);
+
+    /* 文字列を受信する */
+    rc = udp_echo_server(info, errmsg);
+
+    /* ソケットの終期化 */
+    socket_finalize(info);
+
+    return(rc);
+}
+
+/*!
+ * @brief      初期化処理。待受ポート番号を設定する。
+ * @param[in]  argc   コマンドライン引数の数
+ * @param[in]  argv   コマンドライン引数
+ * @param[out] info   サーバ情報
+ * @param[out] errmsg エラーメッセージ格納先
+ * @return     成功ならば0、失敗ならば-1を返す。
+ */
+static int
+initialize(int argc, char *argv[], sv_info_t *info, char *errmsg)
+{
+    /* if(argc != 2){
+        sprintf(errmsg, "Usage: %s <port>\n", argv[0]);
+        return(-1);
+    } */
+
+    memset(info, 0, sizeof(sv_info_t));
+    info->sv_port = 2964;
+
+    return(0);
+}
+
+/*!
+ * @brief   main routine
+ * @return  成功ならば0、失敗ならば-1を返す。
+ */
+int
+main(int argc, char *argv[])
+{
+    int rc = 0;
+    sv_info_t info = {0};
+    char errmsg[256];
+
+    rc = initialize(argc, argv, &info, errmsg);
+    if(rc != 0){
+        fprintf(stderr, "Error: %s\n", errmsg);
+        return(-1);
+    }
+
+    rc = udp_server(&info, errmsg);
+    if(rc != 0){
+        fprintf(stderr, "Error: %s\n", errmsg);
+        return(-1);
+    }
+
+    return(0);
+}
+
